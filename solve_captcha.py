@@ -46,6 +46,21 @@ NOISE_OPEN_ITER  = int(os.environ.get("NOISE_OPEN_ITER", 1))        # apertura l
 MIN_DENSITY      = float(os.environ.get("MIN_DENSITY", 0.05))       # descartar variantes demasiado vacías
 MAX_DENSITY      = float(os.environ.get("MAX_DENSITY", 0.65))       # descartar variantes muy llenas
 MAX_COMPONENTS   = int(os.environ.get("MAX_COMPONENTS", 40))        # descartar si excede número de componentes
+# === Robustez adicional ===
+CONSENSUS        = os.environ.get("CONSENSUS", "1") == "1"       # aplicar votación entre variantes
+TOP_CANDIDATES   = int(os.environ.get("TOP_CANDIDATES", 12))        # máximo de candidatos para consenso
+CONS_MIN_GAIN    = float(os.environ.get("CONS_MIN_GAIN", 0.01))     # ganancia mínima para reemplazar por consenso
+TEMPLATE_METHOD  = os.environ.get("TEMPLATE_METHOD", "ncc").lower() # 'ncc' (correlación) o 'l1'
+UNCERTAIN_GAP    = float(os.environ.get("UNCERTAIN_GAP", 0.02))     # gap mínimo entre mejor y segundo match plantilla
+RESEGMENT        = os.environ.get("RESEGMENT", "1") == "1"       # re-segmentación adaptativa si falta longitud
+RESEG_MAX_ITER   = int(os.environ.get("RESEG_MAX_ITER", 2))         # iteraciones re-seg
+CONFUSION_FIX    = os.environ.get("CONFUSION_FIX", "1") == "1"   # corregir pares confusos
+CONFUSION_PAIRS  = os.environ.get("CONFUSION_PAIRS", "6 b;8 b;8 o;0 o;1 l;c e;c o;5 s").split(';')
+PAD_TEMPLATE     = int(os.environ.get("PAD_TEMPLATE", 2))           # padding blanco antes de redimensionar
+CENTER_TEMPLATE  = os.environ.get("CENTER_TEMPLATE", "1") == "1"  # recentrar por centro de masa
+UNCERTAIN_LABEL  = os.environ.get("UNCERTAIN_LABEL", "?")         # etiqueta si vacío final
+TEMPLATE_ONLY    = os.environ.get("TEMPLATE_ONLY", "0") == "1"    # si 1, salta OCR y usa solo matching de plantillas
+FORCE_FALLBACK   = os.environ.get("FORCE_FALLBACK", "0") == "1"   # si 1, siempre ejecuta fallback de plantillas para comparar
 
 HEX = "0123456789abcdef"
 
@@ -76,6 +91,15 @@ class OcrResult:
     source: str
     angle: int
     ms: float
+
+@dataclass
+class Candidate:
+    text: str
+    conf: float
+    angle: int
+    variant: int
+    method: str  # easy/paddle/template/etc
+    char_confs: List[float]
 
 # === OCR Engines ===
 _EASY = None
@@ -366,22 +390,46 @@ def easyocr_read(img_bin):
 def _char_match_single(glyph: np.ndarray) -> Tuple[str, float]:
     if not _TEMPLATES:
         return '', 0.0
-    # normalizar a TEMPLATE_NORM
     g = glyph
+    if PAD_TEMPLATE>0:
+        g = cv2.copyMakeBorder(g, PAD_TEMPLATE, PAD_TEMPLATE, PAD_TEMPLATE, PAD_TEMPLATE, cv2.BORDER_CONSTANT, value=255)
+    if CENTER_TEMPLATE:
+        m = cv2.moments(255-g)
+        if m['m00']>0:
+            cx = int(m['m10']/m['m00']); cy = int(m['m01']/m['m00'])
+            dx = g.shape[1]//2 - cx; dy = g.shape[0]//2 - cy
+            M = np.float32([[1,0,dx],[0,1,dy]])
+            g = cv2.warpAffine(g, M, (g.shape[1], g.shape[0]), borderValue=255)
     if g.shape[0] != TEMPLATE_NORM or g.shape[1] != TEMPLATE_NORM:
         g = cv2.resize(g, (TEMPLATE_NORM, TEMPLATE_NORM), interpolation=cv2.INTER_AREA)
     g_f = g.astype(np.float32)
-    best_ch, best_score = '', 1e9
-    for ch, arrs in _TEMPLATES.items():
-        for tmpl in arrs:
-            diff = cv2.absdiff(g_f, tmpl.astype(np.float32))
-            score = diff.mean()
-            if score < best_score:
-                best_score = score
-                best_ch = ch
-    # convertir score a pseudo-conf (inversa normalizada)
-    conf = max(0.0, min(1.0, 1.0 - (best_score/255.0)))
-    return best_ch, conf
+    # NCC o diferencia L1
+    if TEMPLATE_METHOD=='ncc':
+        best_ch=''; best_score=-1.0; second=-1.0
+        for ch, arrs in _TEMPLATES.items():
+            for tmpl in arrs:
+                res = cv2.matchTemplate(g_f, tmpl.astype(np.float32), cv2.TM_CCOEFF_NORMED)
+                s = float(res[0,0])
+                if s>best_score:
+                    second = best_score
+                    best_score = s; best_ch = ch
+                elif s>second:
+                    second = s
+        gap = best_score - (second if second>-1 else -1)
+        conf = max(0.0, min(1.0, (best_score+1)/2))
+        if gap < UNCERTAIN_GAP:
+            conf *= 0.75
+        return best_ch, conf
+    else:  # L1
+        best_ch=''; best_score=1e9
+        for ch, arrs in _TEMPLATES.items():
+            for tmpl in arrs:
+                diff = cv2.absdiff(g_f, tmpl.astype(np.float32))
+                s = diff.mean()
+                if s<best_score:
+                    best_score=s; best_ch=ch
+        conf = max(0.0, min(1.0, 1.0 - (best_score/255.0)))
+        return best_ch, conf
 
 def _template_fallback(bin_img: np.ndarray) -> Tuple[str, float]:
     # segmentar por componentes conectados
@@ -487,9 +535,33 @@ def run_one(path):
     if img is None:
         return OcrResult(name, "", 0.0, "none", 0, 0.0)
 
+    # --- Modo solo plantillas (sin OCR entrenado) ---
+    if TEMPLATE_ONLY:
+        crops = clean_and_crop(img)
+        dyn_target = _auto_target_len(crops)
+        fb_text, fb_conf = ('', 0.0)
+        if crops:
+            fb_text, fb_conf = _template_fallback(crops[0])
+        # Re-segmentación opcional si sigue corto
+        if RESEGMENT and len(fb_text) < dyn_target and crops:
+            rc = crops[0].copy()
+            for _ in range(RESEG_MAX_ITER):
+                cnt,_,_,_ = _component_stats(rc)
+                if cnt >= dyn_target: break
+                k = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+                rc = cv2.dilate(rc, k, iterations=1)
+            fb2_text, fb2_conf = _template_fallback(rc)
+            if len(fb2_text) > len(fb_text) or (len(fb2_text)==len(fb_text) and fb2_conf>fb_conf):
+                fb_text, fb_conf = fb2_text, fb2_conf
+        if not fb_text:
+            fb_text = UNCERTAIN_LABEL
+        ms = (time.time()-t0)*1000.0
+        return OcrResult(name, fb_text, float(fb_conf), 'template-only', 0, ms)
+
     crops = clean_and_crop(img)
     dyn_target = _auto_target_len(crops)
     best_text, best_conf, best_src, best_ang = "", 0.0, ENGINE, 0
+    candidates: List[Candidate] = []
     _save_debug_variants(name, img, crops)
 
     tried_angles = list(ANGLE_SWEEP)
@@ -506,6 +578,8 @@ def run_one(path):
             items = _order_by_x(items)
             text  = _postfilter_hex("".join(txt for (_,txt,_) in items))
             conf  = _score(items)
+            char_confs=[float(c) for (_,_,c) in items if _postfilter_hex(_)] if items else []  # simple
+            candidates.append(Candidate(text=text, conf=conf, angle=ang, variant=crop_i, method=ENGINE, char_confs=char_confs))
             prefer = (len(text)==dyn_target, conf)
             best   = (len(best_text)==dyn_target, best_conf)
             if prefer > best:
@@ -526,6 +600,7 @@ def run_one(path):
                 items = _order_by_x(items)
                 text  = _postfilter_hex("".join(txt for (_,txt,_) in items))
                 conf  = _score(items)
+                candidates.append(Candidate(text=text, conf=conf, angle=ang, variant=crop_i, method=ENGINE, char_confs=[float(c) for (_,_,c) in items]))
                 prefer = (len(text)==dyn_target, conf)
                 best   = (len(best_text)==dyn_target, best_conf)
                 if prefer > best:
@@ -537,12 +612,67 @@ def run_one(path):
             break
 
     # Fallback a plantillas si texto muy corto / vacío
-    if USE_TEMPLATES and (len(best_text) < FALLBACK_MIN_LEN):
+    if USE_TEMPLATES and (len(best_text) < FALLBACK_MIN_LEN or FORCE_FALLBACK):
         # usar el primer crop (más probable) para fallback
         fb_text, fb_conf = _template_fallback(crops[0]) if crops else ('',0.0)
         # aceptar fallback solo si mejora longitud o conf
         if len(fb_text) > len(best_text) or (len(fb_text)==len(best_text) and fb_conf>best_conf):
             best_text, best_conf, best_src = fb_text, fb_conf, 'template'
+        candidates.append(Candidate(text=fb_text, conf=fb_conf, angle=0, variant=0, method='template', char_confs=[fb_conf]*len(fb_text)))
+
+    # Re-segmentación adaptativa si aún insuficiente
+    if RESEGMENT and len(best_text) < dyn_target and crops:
+        rc = crops[0].copy()
+        for _ in range(RESEG_MAX_ITER):
+            cnt,_,_,_ = _component_stats(rc)
+            if cnt >= dyn_target: break
+            k = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+            rc = cv2.dilate(rc, k, iterations=1)
+        fb2_text, fb2_conf = _template_fallback(rc)
+        if len(fb2_text) > len(best_text) or (len(fb2_text)==len(best_text) and fb2_conf>best_conf):
+            best_text, best_conf, best_src = fb2_text, fb2_conf, 'template-reseg'
+        candidates.append(Candidate(text=fb2_text, conf=fb2_conf, angle=0, variant=0, method='template-reseg', char_confs=[fb2_conf]*len(fb2_text)))
+
+    # CONSENSO
+    if CONSENSUS:
+        valid = [c for c in candidates if c.text and len(c.text)==dyn_target]
+        if len(valid) >= 2:
+            valid.sort(key=lambda c: c.conf, reverse=True)
+            valid = valid[:TOP_CANDIDATES]
+            pos_votes = [dict() for _ in range(dyn_target)]
+            for c in valid:
+                w = c.conf if c.conf>0 else 0.001
+                for i,ch in enumerate(c.text):
+                    pos_votes[i][ch] = pos_votes[i].get(ch,0.0)+w
+            consensus = ''.join(max(v.items(), key=lambda kv: kv[1])[0] for v in pos_votes)
+            consensus_conf = float(np.mean([max(v.values())/(sum(v.values())+1e-6) for v in pos_votes]))
+            if (consensus != best_text) and (consensus_conf >= best_conf - CONS_MIN_GAIN):
+                best_text, best_conf, best_src = consensus, max(best_conf, consensus_conf), best_src+'+cons'
+
+    # Corrección pares confusos
+    if CONFUSION_FIX and candidates and len(best_text)==dyn_target:
+        position_counts = [dict() for _ in range(dyn_target)]
+        for c in candidates:
+            if len(c.text)!=dyn_target: continue
+            w = c.conf if c.conf>0 else 0.001
+            for i,ch in enumerate(c.text):
+                position_counts[i][ch] = position_counts[i].get(ch,0.0)+w
+        for pair in CONFUSION_PAIRS:
+            parts = pair.strip().split()
+            if len(parts)!=2: continue
+            a,b = parts
+            for i,ch in enumerate(best_text):
+                if ch==a or ch==b:
+                    counts = position_counts[i]
+                    if a in counts and b in counts:
+                        diff = abs(counts[a]-counts[b])/(max(counts[a],counts[b])+1e-6)
+                        if diff < 0.15:  # casi empate
+                            repl = a if counts[a]>counts[b] else b
+                            if repl!=ch:
+                                best_text = best_text[:i]+repl+best_text[i+1:]
+
+    if not best_text:
+        best_text = UNCERTAIN_LABEL
 
     ms = (time.time()-t0)*1000.0
     return OcrResult(name, best_text, float(best_conf), best_src, int(best_ang), ms)
